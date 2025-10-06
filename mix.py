@@ -134,7 +134,7 @@ def mix(source,target,save):
     phase_B = torch.angle(F_B)
     #print(amp_B.shape)
     #print(amp_A.dtype)
-    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.1).squeeze(0)
+    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.1).squeeze(0)   #用A的低频替换B的低频，替换太多颜色很杂
     #print(amp_A.dtype)
     F_mix = amp_B * torch.exp(1j * phase_B)
     #print(F_mix.dtype,F_mix.shape)
