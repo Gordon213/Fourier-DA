@@ -27,7 +27,7 @@ def reconstruct(dense_rec, mins_glb,dense_B):
     #print(dense_rec.shape)
     colors = dense_rec[..., :][occ_mask]  # 直接索引被占用的体素颜色
     colors = colors.clip(0, 1).cpu().numpy()
-    return xyz,colors
+    return colors
     """ pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     pcd.colors = o3d.utility.Vector3dVector(colors)
@@ -42,7 +42,7 @@ def estimate_normals_o3d(xyz: np.ndarray):
     normals = np.asarray(pcd.point["normals"].cpu().numpy())
     return normals
 
-def dedup_with_segment(coords: torch.Tensor, segments: torch.Tensor):
+def dedup_with_segment(coords: torch.Tensor, segments: torch.Tensor,coords_):
     #去重点云坐标，并保留第一个出现的 segment 标签
     device = coords.device
     segments = segments.to(device)
@@ -55,8 +55,9 @@ def dedup_with_segment(coords: torch.Tensor, segments: torch.Tensor):
     first_mask[1:] = inv_sorted[1:] != inv_sorted[:-1]
     first_idx = order[first_mask]
 
+    new_coords=coords_[first_idx]
     unique_segments = segments[first_idx]
-    return unique_segments
+    return new_coords,unique_segments
     
 import torch
 
@@ -95,7 +96,6 @@ def low_freq_mutate_3d_torch(amp_src, amp_trg, L=0.1):
     # 替换低频立方体区域
     a_src[:, d1:d2, h1:h2, w1:w2, :] = a_trg[:, d1:d2, h1:h2, w1:w2, :]
 
-    # 反中心化
     a_src = torch.fft.ifftshift(a_src, dim=(1, 2, 3))
     return a_src
 
@@ -111,11 +111,11 @@ def mix(source,target,save):
     colorA = np.load(os.path.join(path_A, 'color.npy'))/255  #把颜色变成0-1之间
     colorB = np.load(os.path.join(path_B, 'color.npy'))/255
     segment=np.load(os.path.join(path_B, 'segment.npy'))
-
+    coordB_=coordB
     coordA = ((coordA - coordA.min(axis=0)) * 30).astype(np.int64)
     coordB = ((coordB - coordB.min(axis=0)) * 30).astype(np.int64)
 
-    mix_segment=dedup_with_segment(torch.tensor(coordB),torch.tensor(segment))  #由于上面*30，保留去重后的segment标签
+    mix_coord,mix_segment=dedup_with_segment(torch.tensor(coordB),torch.tensor(segment),torch.tensor(coordB_))  #由于上面*30，保留去重后的segment标签
 
     mins_glb = np.minimum(coordA.min(axis=0), coordB.min(axis=0)).astype(np.float32)
     maxs_glb = np.maximum(coordA.max(axis=0), coordB.max(axis=0)).astype(np.float32)
@@ -134,15 +134,17 @@ def mix(source,target,save):
     phase_B = torch.angle(F_B)
     #print(amp_B.shape)
     #print(amp_A.dtype)
-    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.1).squeeze(0)   #用A的低频替换B的低频，替换太多颜色很杂
+    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.1).squeeze(0) #用A的低频替换B的低频，替换太多颜色很杂
     #print(amp_A.dtype)
     F_mix = amp_B * torch.exp(1j * phase_B)
     #print(F_mix.dtype,F_mix.shape)
     dense_mix = torch.fft.ifftn(F_mix, s=(W, H, D), dim=(0, 1, 2)).real
     #print(dense_mix.shape)
-    mix_coord,mix_color=reconstruct(dense_mix, mins_glb, dense_B)
+    mix_color=reconstruct(dense_mix, mins_glb, dense_B)
     #print("done")
     mix_color=mix_color*255
+    mix_coord=mix_coord.cpu().numpy()
+    #print(mix_coord.shape)
     mix_normal=estimate_normals_o3d(mix_coord)
 
     if save is not None:
