@@ -5,18 +5,45 @@ import torch,random
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 device=torch.device("cuda:0")
 
-def build_dense(xyz, rgb, mins_glb, dims, device):
-    idx = np.floor(xyz - mins_glb).astype(np.int64)  
+def build_dense(xyz, rgb, mins_glb, dims, device, segment=None):
+
+    idx = np.floor(xyz - mins_glb).astype(np.int64)
     idx = torch.from_numpy(idx).to(device)
     rgb = torch.from_numpy(rgb).to(device)
 
     W, H, D = dims
-    dense = torch.zeros((W, H, D, 4), dtype=torch.float64, device=device)
+    dense_sum = torch.zeros((W, H, D, 3), dtype=torch.float64, device=device)
+    dense_cnt = torch.zeros((W, H, D), dtype=torch.float64, device=device)
 
-    dense[idx[:, 0], idx[:, 1], idx[:, 2], 0] = 1.0
-    #print(dense[...,0].sum())
-    dense[idx[:, 0], idx[:, 1], idx[:, 2], 1:] = rgb
+    # 展平坐标索引到 1D 索引，方便 scatter 操作
+    linear_idx = idx[:, 0] * (H * D) + idx[:, 1] * D + idx[:, 2]
+
+    # 对 RGB 三个通道分别 scatter_add
+    for c in range(3):
+        dense_sum[..., c].view(-1).scatter_add_(
+            0, linear_idx, rgb[:, c].to(torch.float64)
+        )
+
+    # 对计数 scatter_add
+    dense_cnt.view(-1).scatter_add_(
+        0, linear_idx, torch.ones_like(linear_idx, dtype=torch.float64)
+    )
+
+    # 计算平均颜色
+    dense_rgb = torch.zeros((W, H, D, 3), dtype=torch.float64, device=device)
+    dense_rgb[dense_cnt > 0] = dense_sum[dense_cnt > 0] / dense_cnt[dense_cnt > 0].unsqueeze(-1)
+
+    # 构造最终 dense
+    dense = torch.zeros((W, H, D, 5), dtype=torch.float64, device=device)
+    dense[..., 0] = (dense_cnt > 0).float()              # occupancy
+    dense[..., 1:4] = dense_rgb                          # averaged RGB
+    if segment is not None:
+        segment = torch.as_tensor(segment, dtype=torch.float64, device=device).squeeze(-1)
+        dense[idx[:, 0], idx[:, 1], idx[:, 2], 4] = segment
+    else:
+        dense[..., 4] = 0.0
     return dense
+
 
 def reconstruct(dense_rec, mins_glb,dense_B):
     occ_mask   = dense_B[...,0]==1
@@ -25,9 +52,10 @@ def reconstruct(dense_rec, mins_glb,dense_B):
     #print(coords_ijk.shape)
     xyz        = coords_ijk.astype(np.float32) 
     #print(dense_rec.shape)
-    colors = dense_rec[..., :][occ_mask]  # 直接索引被占用的体素颜色
+    colors = dense_rec[occ_mask]  # 直接索引被占用的体素颜色
     colors = colors.clip(0, 1).cpu().numpy()
-    return colors
+    segment = dense_B[..., 4:5][occ_mask].cpu().numpy()
+    return xyz,colors,segment
     """ pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
     pcd.colors = o3d.utility.Vector3dVector(colors)
@@ -41,25 +69,6 @@ def estimate_normals_o3d(xyz: np.ndarray):
     pcd.estimate_normals( max_nn=30,radius=0.05,)
     normals = np.asarray(pcd.point["normals"].cpu().numpy())
     return normals
-
-def dedup_with_segment(coords: torch.Tensor, segments: torch.Tensor,coords_):
-    #去重点云坐标，并保留第一个出现的 segment 标签
-    device = coords.device
-    segments = segments.to(device)
-
-    unique_coords, inverse_indices, counts = torch.unique(coords, dim=0, return_inverse=True, return_counts=True)
-
-    order = torch.argsort(inverse_indices)
-    inv_sorted = inverse_indices[order]
-    first_mask = torch.ones_like(inv_sorted, dtype=torch.bool)
-    first_mask[1:] = inv_sorted[1:] != inv_sorted[:-1]
-    first_idx = order[first_mask]
-
-    new_coords=coords_[first_idx]
-    unique_segments = segments[first_idx]
-    return new_coords,unique_segments
-    
-import torch
 
 def low_freq_mutate_3d_torch(amp_src, amp_trg, L=0.1):
     """
@@ -111,20 +120,20 @@ def mix(source,target,save):
     colorA = np.load(os.path.join(path_A, 'color.npy'))/255  #把颜色变成0-1之间
     colorB = np.load(os.path.join(path_B, 'color.npy'))/255
     segment=np.load(os.path.join(path_B, 'segment.npy'))
-    coordB_=coordB
+    print(segment.shape,coordB.shape)
     coordA = ((coordA - coordA.min(axis=0)) * 30).astype(np.int64)
     coordB = ((coordB - coordB.min(axis=0)) * 30).astype(np.int64)
 
-    mix_coord,mix_segment=dedup_with_segment(torch.tensor(coordB),torch.tensor(segment),torch.tensor(coordB_))  #由于上面*30，保留去重后的segment标签
+    #mix_coord,mix_segment=dedup_with_segment(torch.tensor(coordB),torch.tensor(segment),torch.tensor(coordB_))  #由于上面*30，保留去重后的segment标签
 
     mins_glb = np.minimum(coordA.min(axis=0), coordB.min(axis=0)).astype(np.float32)
     maxs_glb = np.maximum(coordA.max(axis=0), coordB.max(axis=0)).astype(np.float32)
     dims     = (np.ceil((maxs_glb - mins_glb) ).astype(int) + 1)
     W, H, D  = map(int, dims)
 
-    dense_A = build_dense(coordA, colorA, mins_glb, dims, device)
-    dense_B = build_dense(coordB, colorB, mins_glb, dims, device)
-    #print(dense_A.dtype,dense_B.dtype)
+    dense_A = build_dense(coordA, colorA, mins_glb, dims, device,segment=None)
+    dense_B = build_dense(coordB, colorB, mins_glb, dims, device,segment)
+
     F_A = torch.fft.fftn(dense_A[..., 1:4], dim=(0,1,2))
     F_B = torch.fft.fftn(dense_B[..., 1:4], dim=(0,1,2))
 
@@ -132,30 +141,25 @@ def mix(source,target,save):
     amp_A   = torch.abs(F_A)
     amp_B   = torch.abs(F_B)
     phase_B = torch.angle(F_B)
-    #print(amp_B.shape)
-    #print(amp_A.dtype)
-    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.1).squeeze(0) #用A的低频替换B的低频，替换太多颜色很杂
-    #print(amp_A.dtype)
+
+    amp_B = low_freq_mutate_3d_torch(amp_B, amp_A, 0.5).squeeze(0) #用A的低频替换B的低频，替换太多颜色很杂
+
     F_mix = amp_B * torch.exp(1j * phase_B)
-    #print(F_mix.dtype,F_mix.shape)
+    
     dense_mix = torch.fft.ifftn(F_mix, s=(W, H, D), dim=(0, 1, 2)).real
-    #print(dense_mix.shape)
-    mix_color=reconstruct(dense_mix, mins_glb, dense_B)
+    #print(torch.allclose(dense_mix, dense_B[...,1:4], atol=1e-8, rtol=1e-5))
+    mix_coord,mix_color,mix_segment=reconstruct(dense_mix, mins_glb, dense_B)
     #print("done")
     mix_color=mix_color*255
-    mix_coord=mix_coord.cpu().numpy()
     #print(mix_coord.shape)
     mix_normal=estimate_normals_o3d(mix_coord)
-
+    print(mix_color.shape,mix_coord.shape,mix_normal.shape,mix_segment.shape)
     if save is not None:
         os.makedirs(save, exist_ok=True)
         np.save(os.path.join(save, "coord.npy"), mix_coord)
         np.save(os.path.join(save, "color.npy"), mix_color)
         np.save(os.path.join(save, "normal.npy"), mix_normal)
-        np.save(os.path.join(save, "segment.npy"), mix_segment.numpy())
-    """ print(unique_coords.shape,mix_coord.shape)
-    unique_coords=unique_coords.cpu().numpy()
-    print((unique_coords==mix_coord).all()) """
+        np.save(os.path.join(save, "segment.npy"), mix_segment)
 
 def work(source_root, target_root, mix_scene_func, save_root=None, seed=42):
     """
@@ -204,5 +208,5 @@ work(
 )
 """ source='/A432/lhy/Dataset/structured3d/test/scene_00001_room_906322'
 target='/A432/lhy/Dataset/matterport3d/test/2t7WUuJeko7_00'
-mix(source,target,"/A432/lhy/Dataset/0") """
+mix(source,target,"/A432/lhy/Dataset/0.5") """
 #python Fourier/compare.py
